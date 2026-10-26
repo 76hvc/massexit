@@ -37,12 +37,7 @@ network namespace 里，母机只负责监听和转发——但换成了命令�
 要求 root、Linux、`/dev/net/tun` 可用（LXC 小鸡常被禁，`ls /dev/net/tun` 说没有就免谈）。
 
 ```bash
-# 一行装机，不用 clone
 bash <(curl -fsSL https://raw.githubusercontent.com/76hvc/massexit/main/massexit.sh) install --count 30
-
-# 或者 clone 下来跑（会就地读 lib/massexitd.py）
-git clone https://github.com/76hvc/massexit && cd massexit
-bash massexit.sh install --count 30
 ```
 
 一条命令做完：装依赖（openvpn / curl / iptables / python3，apt·dnf·yum·pacman·apk·zypper 都认）→
@@ -52,18 +47,18 @@ bash massexit.sh install --count 30
 
 ## 日常
 
-```bash
-massexit status          # 每条出口：槽位 / 端口 / 国家 / 出口 IP / 节点 / 状态
-massexit links           # 全部 socks5h:// 链接，直接丢给客户端
-massexit sub             # base64 订阅内容（--links 要明文）
-massexit up 60           # 补到 60 条（已有的不动）
-massexit health          # 手动体检；systemd timer 每 2 分钟也会自动跑
-massexit swap 3          # 第 3 条换个新节点，端口不变
-massexit down            # 拆掉所有出口
-massexit restart 20      # 全拆重建
-massexit logs            # 分发器日志
-massexit uninstall       # 卸干净
-```
+| 命令 | 作用 |
+|---|---|
+| `massexit status` | 每条出口：槽位 / 端口 / 国家 / 出口 IP / 节点 / 状态 |
+| `massexit links` | 全部 `socks5h://` 链接 |
+| `massexit sub` | base64 订阅内容（加 `--links` 要明文） |
+| `massexit up 60` | 补到 60 条，已有的不动 |
+| `massexit health` | 手动体检，systemd timer 每 2 分钟也会跑 |
+| `massexit swap 3` | 第 3 条换新节点，端口不变 |
+| `massexit restart 20` | 全拆重建 |
+| `massexit down` | 拆掉所有出口 |
+| `massexit logs` | 分发器日志 |
+| `massexit uninstall` | 卸干净 |
 
 节点链接长这样：
 
