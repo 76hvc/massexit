@@ -29,8 +29,9 @@ network namespace 里，母机只负责监听和转发——但换成了命令�
 
 1. **netns 内 kill switch**：OUTPUT 只放行 `lo`、`tun0` 和 VPN 服务器本身，其余 REJECT。
    隧道断了就**连不上**，不会偷偷从母机 IP 出去。
-2. **出口 IP 体检**：比对建隧道时记下的出口 IP，连续两次不符或探不到就换节点，
-   **端口不变**，已经发出去的客户端配置继续能用。
+2. **出口 IP 体检**：探测打的是 `https://1.1.1.1/cdn-cgi/trace` 这类 IP 字面量端点，不依赖隧道内 DNS
+   （隧道里 DNS 往往比隧道先挂，拿域名判死会误杀好隧道）；连续两轮不符或探不到就换节点，
+   **端口不变**，已发出去的客户端配置继续能用。探测和重建都并行，几十条一起掉线也能一两轮修回来。
 
 ## 安装
 
@@ -53,7 +54,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/76hvc/massexit/main/massexit
 | `massexit links` | 全部 `socks5h://` 链接 |
 | `massexit sub` | base64 订阅内容（加 `--links` 要明文） |
 | `massexit up 60` | 补到 60 条，已有的不动 |
-| `massexit health` | 手动体检，systemd timer 每 2 分钟也会跑 |
+| `massexit health` | 手动体检，systemd timer 每 5 分钟也会跑 |
+| `massexit check` | 端到端自检：每条出口实拿一次 IP 并与登记值比对 |
 | `massexit swap 3` | 第 3 条换新节点，端口不变 |
 | `massexit restart 20` | 全拆重建 |
 | `massexit down` | 拆掉所有出口 |
@@ -80,7 +82,8 @@ socks5h://msx:鉴权口令@1.2.3.4:20000#JP-115.37.246.110
 | `MAX_TRIES` | 6 | 一个槽位连几个候选都失败就放弃本轮 |
 | `REFRESH_HOURS` | 6 | 节点列表多久重拉一次 |
 | `MEM_PER_EXIT` | 30 | 自动算出口数时每条预留多少 MB |
-| `HEALTH_SEC` | 120 | 体检间隔 |
+| `HEALTH_SEC` | 300 | 体检间隔 |
+| `HEALTH_PARALLEL` | 4 | 体检时并行重建几条 |
 
 ```bash
 massexit down && massexit up auto     # 改完配置这样重来
@@ -95,7 +98,8 @@ VPN Gate 的 API 每次大约给 100 个节点（家宽 80-90），拉三份合�
 ## 已知限制
 
 * SOCKS5 只做 `CONNECT`（TCP），`UDP ASSOCIATE` 返回 0x07。QUIC 之类要走 TCP。
-* VPN Gate 是志愿者节点，一批随时满员/下线（`AUTH_FAILED`），建隧道时会顺着候选往下试。
+* VPN Gate 是志愿者节点，一批随时满员/下线（`AUTH_FAILED`，或者 `Inactivity timeout` 之后连不上），
+  建隧道时会顺着候选往下试；已经连上的高峰期也可能被掐，所以要 5 分钟一轮体检兜着。
 * 公网端口要自己放行（iptables / 云厂商安全组）。
 * 没有流量统计和限速；要这些就前面再挂个 sing-box / xray。
 

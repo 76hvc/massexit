@@ -38,7 +38,8 @@ MAX_TRIES=6
 REFRESH_HOURS=6
 PROBE_URLS="https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip"
 MEM_PER_EXIT=30
-HEALTH_SEC=120
+HEALTH_SEC=300
+HEALTH_PARALLEL=4
 
 if [ -r "$CONF" ]; then . "$CONF"; fi
 
@@ -86,7 +87,8 @@ fetch_nodes() {
   mkdir -p "$OVPN_DIR" "$LOG_DIR" "$SLOT_DIR" "$RUN_DIR"
   local raw=$BASE/api.raw tmp=$BASE/api.tmp i
   : > "$tmp"
-  for i in 1 2 3; do
+  # 每次 API 只回一百来个、而且是轮换的，多拉几遍合并去重能把池子撑大
+  for i in 1 2 3 4 5 6; do
     curl -fsS --max-time 30 -A "massexit/1.0" "https://www.vpngate.net/api/iphone/" >> "$tmp" 2>/dev/null || true
   done
   if [ ! -s "$tmp" ]; then warn "VPN Gate 列表拉取失败，沿用缓存"; return 1; fi
@@ -130,9 +132,13 @@ for rec in reader:
     prev = best.get(host)
     if prev and prev["speed"] >= speed:
         continue
+    proto = "udp"
+    m = re.search(r"^\s*proto\s+(\S+)", cfg, re.M)
+    if m:
+        proto = m.group(1).lower()
     best[host] = {"ip": ip, "cc": cell(rec, "CountryShort"),
                   "country": cell(rec, "CountryLong").replace("\t", " "),
-                  "speed": speed, "cfg": cfg, "res": residential}
+                  "speed": speed, "cfg": cfg, "res": residential, "proto": proto}
 
 os.makedirs(ovpn_dir, exist_ok=True)
 tmp_path = nodes_path + ".tmp"
@@ -143,7 +149,8 @@ with open(tmp_path, "w", encoding="utf-8") as out:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(n["cfg"])
         out.write("\t".join([host, n["ip"], n["cc"], n["country"],
-                             "%.0f" % n["speed"], "1" if n["res"] else "0", path]) + "\n")
+                             "%.0f" % n["speed"], "1" if n["res"] else "0", path,
+                             n["proto"]]) + "\n")
 os.replace(tmp_path, nodes_path)
 print("节点池: %d 个（家宽 %d）" % (len(best), sum(1 for n in best.values() if n["res"])))
 PY
@@ -166,17 +173,23 @@ ensure_nodes() {
 pick_node() {
   (
     flock 9
-    local host ip cc country speed res path hit=""
-    while IFS=$'\t' read -r host ip cc country speed res path; do
-      [ -n "$host" ] || continue
-      [ -f "$path" ] || continue
-      if [ "$RESIDENTIAL_ONLY" = 1 ] && [ "$res" != 1 ]; then continue; fi
-      if [ -f "$USED" ] && grep -qxF "$ip" "$USED"; then continue; fi
-      hit=$host$'\t'$ip$'\t'$cc$'\t'$country$'\t'$path
-      break
-    done < "$NODES"
+    local host ip cc country speed res path proto hit="" pass
+    for pass in udp any; do
+      while IFS=$'\t' read -r host ip cc country speed res path proto; do
+        [ -n "$host" ] || continue
+        [ -f "$path" ] || continue
+        if [ "$pass" = udp ] && [ "$proto" != udp ]; then continue; fi
+        if [ "$RESIDENTIAL_ONLY" = 1 ] && [ "$res" != 1 ]; then continue; fi
+        if [ -f "$USED" ] && grep -qxF "$ip" "$USED"; then continue; fi
+        hit=$host$'\t'$ip$'\t'$cc$'\t'$country$'\t'$path
+        break
+      done < "$NODES"
+      [ -n "$hit" ] && break
+    done
     [ -n "$hit" ] || exit 1
     printf '%s\n' "$ip" >> "$USED"
+    # 只留最近 80 条：节点池就一百来个，历史全留着的话换几轮就没得挑了
+    tail -n 40 "$USED" > "$USED.tmp" 2>/dev/null && mv -f "$USED.tmp" "$USED"
     printf '%s\n' "$hit"
   ) 9>"$BASE/lock"
 }
@@ -226,12 +239,31 @@ start_ovpn() {
     --verb 3 \
     --daemon \
     --writepid "$RUN_DIR/$ns.pid" \
-    --log "$logf" 2>/dev/null || return 1
+    --log "$logf" 9>&- 2>/dev/null || return 1
   while [ "$waited" -lt 30 ]; do
-    if ip -n "$ns" -4 addr show tun0 2>/dev/null | grep -q 'inet '; then return 0; fi
+    if ip -n "$ns" -4 addr show tun0 2>/dev/null | grep -q 'inet '; then
+      apply_pushed_dns "$ns"
+      return 0
+    fi
     sleep 1; waited=$((waited+1))
   done
   return 1
+}
+
+# 优先用 VPN 服务器自己推的 DNS（隧道内可达），再兜底公共 DNS。
+# 只写 8.8.8.8 的话，节点一封 UDP 53，隧道里连域名都解析不了。
+apply_pushed_dns() {
+  local ns=$1 dns_file="/etc/netns/$1/resolv.conf" d seen=""
+  mkdir -p "/etc/netns/$ns"
+  {
+    for d in $(grep -o 'dhcp-option DNS [0-9.]*' "$LOG_DIR/$ns.log" 2>/dev/null | awk '{print $3}' | sort -u); do
+      case " $seen " in *" $d "*) continue ;; esac
+      seen="$seen $d"
+      printf 'nameserver %s\n' "$d"
+    done
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+  } > "$dns_file" 2>/dev/null
+  return 0
 }
 
 kill_ovpn() {
@@ -291,8 +323,28 @@ bump_fail() {
   printf '%s' "$n"
 }
 
+# 不走 DNS 的探测：Cloudflare trace 端点支持 IP 字面量访问，回包里带 ip=
+# （隧道内的 DNS 常常比隧道本身先挂，拿 DNS 判死会把好隧道误杀）
+cf_trace_ip() {
+  local ns=$1 out
+  out=$(ip netns exec "$ns" curl -s -4 --max-time 8 https://1.1.1.1/cdn-cgi/trace 2>/dev/null \
+        | sed -n 's/^ip=//p' | head -1 | tr -d '\r\n ')
+  if [[ "$out" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then printf '%s' "$out"; return 0; fi
+  return 1
+}
+
+# 体检用的快速探测：先打 IP 字面量，不行再退回域名；单轮只试一次，靠连续两轮判死
+probe_exit_fast() {
+  local ns=$1 out
+  out=$(cf_trace_ip "$ns") && { printf '%s' "$out"; return 0; }
+  out=$(ip netns exec "$ns" curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null | tr -d '\r\n ')
+  if [[ "$out" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then printf '%s' "$out"; return 0; fi
+  return 1
+}
+
 probe_exit() {
   local ns=$1 url out
+  out=$(cf_trace_ip "$ns") && { printf '%s' "$out"; return 0; }
   for url in $PROBE_URLS; do
     out=$(ip netns exec "$ns" curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '\r\n ')
     if [[ "$out" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then printf '%s' "$out"; return 0; fi
@@ -522,6 +574,7 @@ Description=massexit health check
 
 [Service]
 Type=oneshot
+TimeoutStartSec=0
 ExecStart=/usr/local/bin/massexit health --quiet
 EOF
 
@@ -623,42 +676,58 @@ cmd_health() {
   local quiet=0
   [ "${1:-}" = --quiet ] && quiet=1
   exec 9>"$BASE/health.lock"
-  flock -n 9 || return 0
+  # 定时任务抢不到锁就直接跳过（不然上一轮还没跑完，下一轮又叠上来一起重建）；
+  # 手动跑的愿意等一会儿
+  if [ "$quiet" = 1 ]; then
+    flock -n 9 || { log "上轮体检还没跑完，这轮跳过"; return 0; }
+  else
+    flock -w 60 9 || { log "等不到体检锁，上轮还在跑"; return 0; }
+  fi
   ensure_nodes 2>/dev/null || true
-  local f slot ns port cc country host status cur old n hip changed=0 total=0
+
+  local hip tmpd f slot ns port cc country host status cur old n
+  local changed=0 total=0
+  local -a broken=()
   hip=$(host_ip)
+  tmpd=$(mktemp -d "$BASE/health.XXXXXX")
+
+  # 探测并行跑：几十条出口一起掉线时，串行探测一条 14 秒能拖十分钟
   for f in "$SLOT_DIR"/*.env; do
     [ -f "$f" ] || continue
     total=$((total+1))
     slot=$(basename "$f" .env)
-    ns=$( . "$f"; printf '%s' "$NS" )
-    status=$( . "$f"; printf '%s' "$STATUS" )
-    port=$( . "$f"; printf '%s' "$PORT" )
-    cc=$( . "$f"; printf '%s' "$CC" )
-    country=$( . "$f"; printf '%s' "$COUNTRY" )
-    host=$( . "$f"; printf '%s' "$HOSTNAME" )
-    old=$( . "$f"; printf '%s' "$EXITIP" )
-
-    # netns 或 tun 都没了：直接重建，同端口
-    if [ "$status" != up ] || [ ! -e "/var/run/netns/$ns" ]; then
-      log "slot $slot 掉线，重建（端口 $port）"
-      teardown_slot "$slot"
-      bring_up_slot "$slot" >/dev/null 2>&1
-      changed=$((changed+1)); continue
-    fi
-
-    cur=$(probe_exit "$ns" || true)
-    [ -z "$cur" ] && cur=$(probe_exit "$ns" || true)
-    if [ -z "$cur" ] || [ "$cur" = "$hip" ]; then
-      n=$(bump_fail "$slot")
-      if [ "$n" -lt 2 ]; then
-        log "slot $slot 首次探测失败（$cur），再观察一轮"
-        continue
+    (
+      . "$f"
+      cur=""
+      if [ "${STATUS:-}" = up ] && [ -e "/var/run/netns/${NS}" ]; then
+        cur=$(probe_exit_fast "${NS}" || true)
       fi
-      log "slot $slot 连续 $n 次不通（$cur），换节点（端口 $port 不变）"
-      teardown_slot "$slot"
-      bring_up_slot "$slot" >/dev/null 2>&1
-      changed=$((changed+1)); continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$SLOT" "${NS}" "${PORT:-}" "${CC:-}" "${COUNTRY:-}" "${HOSTNAME:-}" "${EXITIP:-}" "${STATUS:-}" "$cur" \
+        > "$tmpd/$(printf '%03d' "$SLOT")"
+    ) &
+    while [ "$(jobs -rp | wc -l)" -ge 10 ]; do sleep 0.2; done
+  done
+  wait
+
+  # 结果顺序处理：判死、记 IP 变化、排队重建
+  for f in "$tmpd"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r slot ns port cc country host old status cur < "$f"
+    if [ "$status" != up ] || [ -z "$cur" ] || [ "$cur" = "$hip" ]; then
+      if [ "$status" != up ]; then
+        log "slot $slot 掉线，进重建队列（端口 $port）"
+        broken+=("$slot")
+      else
+        n=$(bump_fail "$slot")
+        if [ "$n" -lt 2 ]; then
+          log "slot $slot 首次探测失败（${cur:-空}），再观察一轮"
+        else
+          log "slot $slot 连续 $n 次不通，进重建队列（端口 $port 不变）"
+          broken+=("$slot")
+        fi
+      fi
+      continue
     fi
     clear_fail "$slot"
     if [ "$cur" != "$old" ]; then
@@ -667,6 +736,19 @@ cmd_health() {
       changed=$((changed+1))
     fi
   done
+  rm -rf "$tmpd"
+
+  # 重建并行跑
+  local s
+  if [ "${#broken[@]}" -gt 0 ]; then
+    for s in "${broken[@]}"; do
+      [ -n "$s" ] || continue
+      ( teardown_slot "$s"; bring_up_slot "$s" >/dev/null 2>&1 ) &
+      while [ "$(jobs -rp | wc -l)" -ge "$HEALTH_PARALLEL" ]; do sleep 0.5; done
+      changed=$((changed+1))
+    done
+    wait
+  fi
   sync_exits_tsv
   [ "$quiet" = 0 ] && ok "体检完成: $total 条出口，修复 $changed 条"
   return 0
@@ -694,6 +776,34 @@ cmd_restart() {
   cmd_status
 }
 
+# 端到端自检：从本机走每条出口的 SOCKS 端口拿一次出口 IP，比对登记值
+cmd_check() {
+  local cred f tmpd s p c w g ok=0 bad=0
+  cred=$(cat "$CRED" 2>/dev/null || echo "msx:")
+  tmpd=$(mktemp -d /tmp/massexit-check.XXXXXX)
+  for f in "$SLOT_DIR"/*.env; do
+    [ -f "$f" ] || continue
+    ( . "$f"
+      got=$(curl -s --max-time 12 --socks5-hostname "$cred@127.0.0.1:${PORT}" https://api.ipify.org 2>/dev/null | tr -d '\r\n ')
+      printf '%s\t%s\t%s\t%s\t%s\n' "$SLOT" "$PORT" "${CC:-?}" "${EXITIP:--}" "${got:--}" > "$tmpd/$(printf '%03d' "$SLOT")" ) &
+    while [ "$(jobs -rp | wc -l)" -ge 10 ]; do sleep 0.3; done
+  done
+  wait
+  printf '%-4s %-6s %-4s %-16s %-16s %s\n' SLOT PORT CC 登记IP 实测IP 结果
+  for f in "$tmpd"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r s p c w g < "$f"
+    if [ "$g" = "$w" ]; then
+      ok=$((ok+1)); printf '%-4s %-6s %-4s %-16s %-16s %s\n' "$s" "$p" "$c" "$w" "$g" ok
+    else
+      bad=$((bad+1)); printf '%-4s %-6s %-4s %-16s %-16s %s\n' "$s" "$p" "$c" "$w" "$g" "${C_R}异常${C_0}"
+    fi
+  done
+  rm -rf "$tmpd"
+  printf '\n正常 %s 条，异常 %s 条\n' "$ok" "$bad"
+  [ "$bad" = 0 ]
+}
+
 cmd_logs() { journalctl -u massexit.service -n 100 --no-pager; }
 
 cmd_uninstall() {
@@ -719,6 +829,7 @@ massexit — VPN Gate 出口铺成 SOCKS5 节点（一条出口一个端口）
   info                       连接信息 + 全部节点
   health [--quiet]           体检并自动修复/换节点
   swap N                     第 N 条出口换一个新节点（端口不变）
+  check                      端到端自检：每条出口实拿一次 IP 并比对
   restart [N|auto]           全部重建
   down                       拆掉所有出口
   logs                       服务日志
@@ -739,6 +850,7 @@ main() {
     info) cmd_info ;;
     health) cmd_health "$@" ;;
     swap) cmd_swap "$@" ;;
+    check) cmd_check ;;
     restart) cmd_restart "$@" ;;
     logs) cmd_logs ;;
     uninstall|remove) cmd_uninstall ;;
