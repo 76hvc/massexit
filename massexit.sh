@@ -352,7 +352,9 @@ existing_port() {
 }
 
 sync_exits_tsv() {
-  local tmp=$EXITS_TSV.tmp f
+  local tmp f
+  # 并发建隧道时多个写入方会撞在同一个临时文件上，用唯一文件名避开
+  tmp=$(mktemp "$BASE/exits.XXXXXX") || return 0
   : > "$tmp"
   for f in "$SLOT_DIR"/*.env; do
     [ -f "$f" ] || continue
