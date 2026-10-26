@@ -367,6 +367,10 @@ bring_up_slot() {
   ns=$(ns_name "$slot")
   port=$(existing_port "$slot") || port=$(slot_port "$slot")
   hip=$(host_ip)
+  # 先把这条出口摘下来（分发器会关掉对应监听），重建期间客户端拿到的是明确的拒绝，
+  # 而不是一个半成品连接。
+  write_slot "$slot" "$port" "" "" "" "" down
+  sync_exits_tsv
   while [ "$tries" -lt "$MAX_TRIES" ]; do
     tries=$((tries+1))
     if ! node=$(pick_node); then
@@ -376,11 +380,13 @@ bring_up_slot() {
     IFS=$'\t' read -r host ip cc country path <<< "$node"
     teardown_slot "$slot"
     if ! setup_netns "$slot"; then warn "slot $slot: netns 建立失败"; continue; fi
+    # 保险先装：此刻只有"回 VPN 服务器"这一条路是通的，
+    # tun0 还没起来之前任何连接都会被 REJECT，不会漏出母机 IP。
+    install_killswitch "$ns" "$path"
     if ! start_ovpn "$slot" "$path"; then
       log "slot $slot: $host 连不上（候选 $tries）"
       teardown_slot "$slot"; continue
     fi
-    install_killswitch "$ns" "$path"
     if ! exitip=$(probe_exit "$ns"); then
       log "slot $slot: $host 探不到出口 IP（候选 $tries）"
       teardown_slot "$slot"; continue
@@ -391,6 +397,7 @@ bring_up_slot() {
     fi
     write_slot "$slot" "$port" "$cc" "$country" "$exitip" "$host" up
     clear_fail "$slot"
+    sync_exits_tsv
     ok "slot $slot  port $port  $cc  $host  -> $exitip"
     return 0
   done
